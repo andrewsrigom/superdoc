@@ -2,6 +2,7 @@ import { EventEmitter } from 'eventemitter3';
 import { createApp } from 'vue';
 import { undoDepth, redoDepth } from 'prosemirror-history';
 import { makeDefaultItems } from './defaultItems';
+import { createHeadlessToolbar } from '../../../../headless-toolbar/create-headless-toolbar.js';
 import { getActiveFormatting } from '@core/helpers/getActiveFormatting.js';
 import { findParentNode } from '@helpers/index.js';
 import { vClickOutside } from '@superdoc/common';
@@ -9,16 +10,12 @@ import Toolbar from './Toolbar.vue';
 import { getFileOpener, processAndInsertImageFile } from '../../extensions/image/imageHelpers/index.js';
 import { toolbarIcons } from './toolbarIcons.js';
 import { toolbarTexts } from './toolbarTexts.js';
-import { getQuickFormatList } from '@extensions/linked-styles/index.js';
+import { HEADLESS_TOOLBAR_COMMANDS, HEADLESS_ITEM_MAP, TABLE_ACTION_COMMAND_IDS } from './constants.js';
 import { getAvailableColorOptions, makeColorOption, renderColorOptions } from './color-dropdown-helpers.js';
-import { isInTable } from '@helpers/isInTable.js';
 import { useToolbarItem } from '@components/toolbar/use-toolbar-item';
 import { yUndoPluginKey } from 'y-prosemirror';
 import { isNegatedMark } from './format-negation.js';
-import { collectTrackedChanges, isTrackedChangeActionAllowed } from '@extensions/track-changes/permission-helpers.js';
-import { isList } from '@core/commands/list-helpers';
 import { calculateResolvedParagraphProperties } from '@extensions/paragraph/resolvedPropertiesCache.js';
-import { twipsToLines } from '@converter/helpers';
 import { parseSizeUnit } from '@core/utilities';
 import { encodeMarksFromRPr } from '@core/super-converter/styles.js';
 import { NodeSelection } from 'prosemirror-state';
@@ -190,11 +187,14 @@ export class SuperToolbar extends EventEmitter {
     this.config = { ...this.config, ...config };
     this.toolbarItems = [];
     this.overflowItems = [];
-    this.documentMode = config.documentMode || 'editing';
     this.isDev = config.isDev || false;
     this.superdoc = config.superdoc;
     this.role = config.role || 'editor';
     this.toolbarContainer = null;
+
+    this.controller = null;
+    this.snapshot = null;
+    this._unsubscribeController = null;
 
     if (this.config.editor) {
       this.config.mode = this.config.editor.options.mode;
@@ -281,7 +281,39 @@ export class SuperToolbar extends EventEmitter {
       this.toolbar = this.app.mount(this.toolbarContainer);
     }
     this.activeEditor = config.editor || null;
+    this.initHeadlessToolbar();
     this.updateToolbarState();
+  }
+
+  createHeadlessToolbar() {
+    if (!this.superdoc) return null;
+
+    return createHeadlessToolbar({
+      superdoc: this.superdoc,
+      commands: HEADLESS_TOOLBAR_COMMANDS,
+    });
+  }
+
+  initHeadlessToolbar() {
+    if (!this.superdoc) return;
+
+    this.destroyHeadlessToolbar();
+
+    this.controller = this.createHeadlessToolbar();
+    this.snapshot = this.controller.getSnapshot();
+
+    this._unsubscribeController = this.controller.subscribe(({ snapshot }) => {
+      this.snapshot = snapshot;
+      this.updateToolbarState();
+    });
+  }
+
+  destroyHeadlessToolbar() {
+    this._unsubscribeController?.();
+    this.controller?.destroy?.();
+    this.controller = null;
+    this.snapshot = null;
+    this._unsubscribeController = null;
   }
 
   findElementBySelector(selector) {
@@ -816,7 +848,8 @@ export class SuperToolbar extends EventEmitter {
     const documentModeItem = this.getToolbarItemByName('documentMode');
     if (!documentModeItem) return;
 
-    const mode = (this.documentMode || 'editing').toLowerCase();
+    const snapshotMode = this.snapshot?.commands?.['document-mode']?.value;
+    const mode = (snapshotMode || 'editing').toLowerCase();
     const texts = this.config.texts || {};
     const icons = this.config.icons || {};
     const map = {
@@ -846,6 +879,114 @@ export class SuperToolbar extends EventEmitter {
     }
   }
 
+  #getFontFamilyFallbackValue() {
+    // Legacy empty-paragraph fallback kept in the toolbar adapter for now.
+    // This should likely move into the headless font-family state deriver once parity is completed.
+    if (!this.activeEditor?.state) return null;
+
+    const { state } = this.activeEditor;
+    const selection = state.selection;
+    if (!selection?.empty) return null;
+
+    const paragraphParent = findParentNode((n) => n.type.name === 'paragraph')(selection);
+    if (!paragraphParent || paragraphParent.node?.content?.size !== 0) return null;
+
+    const paragraphProps = calculateResolvedParagraphProperties(
+      this.activeEditor,
+      paragraphParent.node,
+      state.doc.resolve(paragraphParent.pos),
+    );
+
+    return (
+      getParagraphFontFamilyFromProperties(paragraphProps, this.activeEditor?.converter?.convertedXml ?? {}) || null
+    );
+  }
+
+  #applyHeadlessState(item) {
+    if (item.name.value === 'tableActions') {
+      const tableActionStates = TABLE_ACTION_COMMAND_IDS.map((commandId) => this.snapshot?.commands?.[commandId]);
+      const hasAnyEnabled = tableActionStates.some((state) => state && !state.disabled);
+      item.setDisabled(!hasAnyEnabled);
+      return true;
+    }
+
+    const commandId = HEADLESS_ITEM_MAP[item.name.value];
+    if (!commandId) return false;
+
+    const commandState = this.snapshot?.commands?.[commandId];
+    item.setDisabled(Boolean(commandState?.disabled));
+
+    if (item.name.value === 'textAlign') {
+      if (commandState?.value) item.activate({ textAlign: commandState.value });
+      else item.deactivate();
+      return true;
+    }
+
+    if (item.name.value === 'lineHeight') {
+      item.selectedValue.value = commandState?.value != null ? commandState.value : '';
+      return true;
+    }
+
+    if (item.name.value === 'zoom') {
+      if (commandState?.value != null) {
+        const zoomValue =
+          typeof commandState.value === 'number' ? `${commandState.value}%` : String(commandState.value);
+        item.onActivate({ zoom: zoomValue });
+      }
+      return true;
+    }
+
+    if (item.name.value === 'documentMode') {
+      this.#syncDocumentModeUi();
+      return true;
+    }
+
+    if (item.name.value === 'link') {
+      item.active.value = Boolean(commandState?.active);
+      item.attributes.value = commandState?.value ? { href: commandState.value } : {};
+      return true;
+    }
+
+    if (item.name.value === 'fontFamily') {
+      if (commandState?.value != null) {
+        item.activate({ fontFamily: commandState.value });
+        return true;
+      }
+
+      const fallbackFontFamily = this.#getFontFamilyFallbackValue();
+      if (fallbackFontFamily) {
+        item.activate({ fontFamily: fallbackFontFamily });
+        return true;
+      }
+
+      item.deactivate();
+      return true;
+    }
+
+    if (item.name.value === 'color') {
+      if (commandState?.value != null) item.activate({ color: commandState.value });
+      else item.deactivate();
+      return true;
+    }
+
+    if (item.name.value === 'highlight') {
+      if (commandState?.value != null) item.activate({ color: commandState.value });
+      else item.deactivate();
+      return true;
+    }
+
+    if (item.name.value === 'linkedStyles') {
+      if (commandState?.value != null) item.activate({ styleId: commandState.value });
+      else item.label.value = this.config.texts?.formatText || 'Format text';
+      return true;
+    }
+
+    if (commandState?.active) item.activate();
+    else item.deactivate();
+
+    return true;
+  }
+
   /**
    * Update the toolbar state based on the current editor state
    * Updates active/inactive state of all toolbar items
@@ -859,7 +1000,10 @@ export class SuperToolbar extends EventEmitter {
 
     // Deactivate toolbar items if no active editor
     // This will skip buttons that are marked as allowWithoutEditor
-    if (!this.activeEditor || this.documentMode === 'viewing') {
+    const snapshotMode = this.snapshot?.commands?.['document-mode']?.value;
+    const currentMode = snapshotMode || 'editing';
+
+    if (!this.activeEditor || currentMode === 'viewing') {
       this.#deactivateAll();
       return;
     }
@@ -870,28 +1014,8 @@ export class SuperToolbar extends EventEmitter {
       return;
     }
     const selection = state.selection;
-    const selectionTrackedChanges = this.#enrichTrackedChanges(
-      collectTrackedChanges({ state, from: selection.from, to: selection.to }),
-    );
-    const hasTrackedChanges = selectionTrackedChanges.length > 0;
-    const hasValidSelection = hasTrackedChanges;
-    const canAcceptTrackedChanges =
-      hasValidSelection &&
-      isTrackedChangeActionAllowed({
-        editor: this.activeEditor,
-        action: 'accept',
-        trackedChanges: selectionTrackedChanges,
-      });
-    const canRejectTrackedChanges =
-      hasValidSelection &&
-      isTrackedChangeActionAllowed({
-        editor: this.activeEditor,
-        action: 'reject',
-        trackedChanges: selectionTrackedChanges,
-      });
 
     const marks = getActiveFormatting(this.activeEditor);
-    const inTable = isInTable(this.activeEditor.state);
     const paragraphParent = findParentNode((n) => n.type.name === 'paragraph')(selection);
     const paragraphProps = paragraphParent
       ? calculateResolvedParagraphProperties(
@@ -900,41 +1024,11 @@ export class SuperToolbar extends EventEmitter {
           state.doc.resolve(paragraphParent.pos),
         )
       : null;
-    const selectionIsCollapsed = selection.empty;
-    const paragraphIsEmpty = paragraphParent?.node?.content?.size === 0;
-    const paragraphFontFamily = getParagraphFontFamilyFromProperties(
-      paragraphProps,
-      this.activeEditor?.converter?.convertedXml ?? {},
-    );
-
     this.toolbarItems.forEach((item) => {
       item.resetDisabled();
-      let activatedFromLinkedStyle = false;
 
-      if (item.name.value === 'undo') {
-        item.setDisabled(this.undoDepth === 0);
-      }
-
-      if (item.name.value === 'redo') {
-        item.setDisabled(this.redoDepth === 0);
-      }
-
-      if (item.name.value === 'acceptTrackedChangeBySelection') {
-        item.setDisabled(!canAcceptTrackedChanges);
-      }
-
-      if (item.name.value === 'rejectTrackedChangeOnSelection') {
-        item.setDisabled(!canRejectTrackedChanges);
-      }
-
-      // Linked Styles dropdown behaves a bit different from other buttons.
-      // We need to disable it manually if there are no linked styles to show
-      if (item.name.value === 'linkedStyles') {
-        if (this.activeEditor && !getQuickFormatList(this.activeEditor).length) {
-          return item.deactivate();
-        } else {
-          return item.activate({ styleId: paragraphProps?.styleId || null });
-        }
+      if (this.#applyHeadlessState(item)) {
+        return;
       }
 
       const rawActiveMark = marks.find((mark) => mark.name === item.name.value);
@@ -957,7 +1051,6 @@ export class SuperToolbar extends EventEmitter {
       if (!activeMark && !markNegated && paragraphParent && paragraphProps?.styleId) {
         const markToStyleMap = {
           fontSize: 'font-size',
-          fontFamily: 'font-family',
           bold: 'bold',
         };
         const linkedStyles = this.activeEditor.converter?.linkedStyles.find(
@@ -974,54 +1067,6 @@ export class SuperToolbar extends EventEmitter {
             [item.name.value]: linkedStylesItem,
           };
           item.activate(value);
-          activatedFromLinkedStyle = true;
-        }
-      }
-      if (item.name.value === 'textAlign' && paragraphProps?.justification) {
-        item.activate({ textAlign: paragraphProps.justification });
-      }
-
-      if (
-        item.name.value === 'fontFamily' &&
-        selectionIsCollapsed &&
-        paragraphIsEmpty &&
-        !activeMark &&
-        !markNegated &&
-        !activatedFromLinkedStyle &&
-        paragraphFontFamily
-      ) {
-        item.activate({ fontFamily: paragraphFontFamily });
-      }
-
-      if (item.name.value === 'lineHeight') {
-        if (paragraphProps?.spacing) {
-          item.selectedValue.value = twipsToLines(paragraphProps.spacing.line);
-        } else {
-          item.selectedValue.value = '';
-        }
-      }
-
-      if (item.name.value === 'tableActions') {
-        item.disabled.value = !inTable;
-      }
-
-      // Activate list buttons when selections is inside list
-      const listParent = isList(paragraphParent?.node) ? paragraphParent.node : null;
-      if (listParent) {
-        const numberingType = listParent.attrs.listRendering.numberingType;
-        if (item.name.value === 'list' && numberingType === 'bullet') {
-          item.activate();
-        } else if (item.name.value === 'numberedlist' && numberingType !== 'bullet') {
-          item.activate();
-        }
-      }
-
-      // Activate ruler button when rulers are visible
-      if (item.name.value === 'ruler') {
-        if (this.superdoc?.config?.rulers) {
-          item.activate();
-        } else {
-          item.deactivate();
         }
       }
     });
@@ -1084,21 +1129,6 @@ export class SuperToolbar extends EventEmitter {
       this.undoDepth = 0;
       this.redoDepth = 0;
     }
-  }
-
-  #enrichTrackedChanges(trackedChanges = []) {
-    if (!trackedChanges?.length) return trackedChanges;
-    const store = this.superdoc?.commentsStore;
-    if (!store?.getComment) return trackedChanges;
-
-    return trackedChanges.map((change) => {
-      const commentId = change.id;
-      if (!commentId) return change;
-      const storeComment = store.getComment(commentId);
-      if (!storeComment) return change;
-      const comment = typeof storeComment.getValues === 'function' ? storeComment.getValues() : storeComment;
-      return { ...change, comment };
-    });
   }
 
   /**
@@ -1383,6 +1413,8 @@ export class SuperToolbar extends EventEmitter {
       clearTimeout(this._restoreFocusTimeoutId);
       this._restoreFocusTimeoutId = null;
     }
+
+    this.destroyHeadlessToolbar();
   }
 }
 
