@@ -82,7 +82,8 @@ export interface PageStyles {
  * including `SuperToolbar` which extends EventEmitter.
  */
 export interface Toolbar {
-  setActiveEditor?: (editor: unknown) => void;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  setActiveEditor?: (editor: any) => void;
 }
 
 /**
